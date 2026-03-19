@@ -3,7 +3,7 @@
 MMA Relay Daemon Client  (runs inside each DP rank process)
 
 Responsibilities:
-  1. Startup:  register kv_cache IPC handle with daemon
+  1. Startup:  register per-layer kv_cache IPC handles with daemon
                obtain pinned CPU pool mapping (mmap shm)
                wait for daemon_ready_flag
   2. Runtime:  push transfer requests via lock-free ring buffer
@@ -11,8 +11,12 @@ Responsibilities:
   3. Shutdown: cleanup mmap handles
 
 Address translation (hot path):
-  GPU side : rank passes byte offset into kv_cache tensor
-             daemon maps = kv_cache_ptrs[rank] + offset
+  GPU side : rank passes (layer_idx, gpu_byte_offset)
+             daemon maps = kv_layer_ptrs[rank][layer_idx] + gpu_byte_offset
+             Each layer_ptr is opened independently via cudaIpcOpenMemHandle,
+             corresponding to a single cudaMalloc allocation in the rank process.
+             This matches vLLM's KV cache layout where each layer is allocated
+             independently (uniform layout) or in groups (hybrid layout).
   CPU side : client allocates slots from cpu_pool (bump allocator)
              daemon writes/reads pinned memory at cpu_pool_ptr + offset
              rank reads results from mmap'd cpu_pool shm at same offset
@@ -37,11 +41,11 @@ from vllm.v1.kv_offload.worker.mma_daemon import (
     _META_OFF_NUM_RANKS,
     _META_OFF_CPU_TOTAL,
     _META_OFF_CPU_SHM_SZ,
-    _META_OFF_KV_SIZES,
-    _META_OFF_IPC_HANDLES,
+    _META_OFF_NUM_LAYERS,
     _META_OFF_RANK_READY,
     _META_OFF_DAEMON_RDY,
     _IPC_HANDLE_SIZE,
+    _HANDLE_ENTRY_SIZE,
     _RING_TOTAL_BYTES,
     _RING_HDR_HEAD,
     _RING_HDR_TAIL,
@@ -56,18 +60,22 @@ from vllm.v1.kv_offload.worker.mma_daemon import (
     _SLOT_OFF_DIRECTION,
     _SLOT_OFF_STATUS,
     _SLOT_OFF_SRC_GPU,
+    _SLOT_OFF_LAYER_IDX,
     _SLOT_OFF_GPU_OFFSET,
     _SLOT_OFF_CPU_OFFSET,
     _SLOT_OFF_SIZE,
     _SHM_META_NAME,
     _SHM_CPU_POOL_NAME,
     _SHM_RING_NAME,
+    _SHM_HANDLES_NAME,
+    _MAX_LAYERS,
     DIR_D2H,
     DIR_H2D,
     STATUS_PENDING,
     STATUS_DONE,
     STATUS_ERROR,
     _shm_open,
+    _shm_create,
     _read_u64,
     _write_u64,
     _get_ipc_handle,
@@ -81,47 +89,104 @@ class MMADaemonClient:
     """
     Per-DP-rank client that communicates with the MMA Relay Daemon.
 
+    Key change from v1: GPU KV cache is registered per-layer.
+    Each layer tensor corresponds to one independent cudaMalloc allocation
+    in vLLM (uniform KV cache layout). The daemon maps each layer separately
+    via cudaIpcOpenMemHandle, so gpu_offset in each transfer slot is always
+    within the bounds of a single allocation — no cross-allocation pointer
+    arithmetic, no undefined behavior.
+
     Typical lifecycle:
-        client = MMADaemonClient(rank=local_rank, kv_cache_tensor=gpu_tensor)
-        client.attach(timeout_s=30)      # blocks until daemon is ready
+        client = MMADaemonClient(rank=local_rank)
+        client.register_kv_layers(kv_caches)   # dict[layer_name → Tensor]
+        client.attach(timeout_s=30)             # blocks until daemon is ready
         # ... during inference:
-        job_id = client.submit_d2h(gpu_byte_offset, cpu_slot_id, size_bytes)
-        finished = client.poll_completions()   # returns list of (job_id, ok)
-        # cleanup:
+        job_id = client.submit_d2h(layer_idx, gpu_byte_offset, cpu_slot_id, size_bytes)
+        finished = client.poll_completions()
         client.detach()
     """
 
-    def __init__(self, rank: int, kv_cache_tensor: torch.Tensor):
+    def __init__(self, rank: int):
         """
         Args:
-            rank          : DP rank index (0..num_ranks-1), also physical GPU id
-            kv_cache_tensor: The GPU KV cache tensor for this rank.
-                            Must be contiguous and on CUDA.
+            rank : DP rank index (0..num_ranks-1), also physical GPU id.
         """
         assert rank >= 0
-        assert kv_cache_tensor.is_cuda and kv_cache_tensor.is_contiguous()
-
         self.rank = rank
-        self.kv_cache_tensor = kv_cache_tensor
-        self.kv_cache_base_ptr: int = kv_cache_tensor.data_ptr()
-        self.kv_cache_size: int = kv_cache_tensor.numel() * kv_cache_tensor.element_size()
+
+        # Per-layer info (populated by register_kv_layers before attach)
+        self._layer_names: list[str] = []           # ordered layer names
+        self._layer_tensors: list[torch.Tensor] = []
+        self._layer_base_ptrs: list[int] = []       # data_ptr() of each layer
+        self._layer_sizes: list[int] = []           # numel * element_size
+        self._num_layers: int = 0
 
         # Shared memory handles (opened at attach time)
         self.meta_mm: Optional[mmap.mmap] = None
         self.ring_mm: Optional[mmap.mmap] = None
         self.cpu_pool_mm: Optional[mmap.mmap] = None
 
-        # CPU pool slot allocator (simple bump allocator with free-list)
-        # Caller uses alloc_cpu_slot / free_cpu_slot to manage CPU buffer slots
+        # CPU pool slot allocator (simple bump allocator)
         self._cpu_pool_size: int = 0
         self._cpu_pool_lock = threading.Lock()
-        self._cpu_slot_next: int = 0       # next free byte offset
+        self._cpu_slot_next: int = 0
 
-        # Job tracking: job_id → cpu_slot_offset (for reclaim after completion)
+        # Job tracking
         self._pending_jobs: dict[int, int] = {}   # job_id → cpu_offset
         self._job_counter: int = 0
 
         self._attached = False
+
+    # ------------------------------------------------------------------
+    # Layer registration (must call before attach)
+    # ------------------------------------------------------------------
+
+    def register_kv_layers(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        """
+        Register per-layer KV cache tensors.
+
+        Each tensor must be:
+          - On CUDA (this rank's GPU)
+          - The direct result of cudaMalloc (i.e. the raw allocation tensor from
+            vLLM's _allocate_kv_cache, before reshape/permute).
+            If you only have the reshaped tensors (post _reshape_kv_cache),
+            pass the contiguous base tensor for each layer.
+
+        Args:
+            kv_caches: dict mapping layer_name → kv_cache tensor.
+                       Ordering is preserved; layer_idx in transfer slots
+                       corresponds to the insertion order of this dict.
+        """
+        assert not self._attached, "register_kv_layers must be called before attach()"
+        assert len(kv_caches) > 0, "kv_caches must not be empty"
+        assert len(kv_caches) <= _MAX_LAYERS, \
+            f"Too many layers ({len(kv_caches)} > _MAX_LAYERS={_MAX_LAYERS})"
+
+        self._layer_names = list(kv_caches.keys())
+        self._layer_tensors = []
+        self._layer_base_ptrs = []
+        self._layer_sizes = []
+
+        for layer_name, tensor in kv_caches.items():
+            assert tensor.is_cuda, f"Layer {layer_name}: tensor must be on CUDA"
+            # Get the contiguous base for IPC registration.
+            # cudaIpcGetMemHandle requires the pointer returned by cudaMalloc;
+            # for non-contiguous views we use the storage data_ptr (base of alloc).
+            base_ptr = tensor.storage().data_ptr()
+            size_bytes = tensor.storage().nbytes()
+            self._layer_tensors.append(tensor)
+            self._layer_base_ptrs.append(base_ptr)
+            self._layer_sizes.append(size_bytes)
+
+        self._num_layers = len(self._layer_names)
+        logger.info(
+            "[Rank %d] Registered %d KV cache layers for IPC export",
+            self.rank, self._num_layers,
+        )
+
+    def layer_index(self, layer_name: str) -> int:
+        """Return the layer_idx for a given layer_name (for use in submit_*)."""
+        return self._layer_names.index(layer_name)
 
     # ------------------------------------------------------------------
     # Attach / detach
@@ -131,15 +196,18 @@ class MMADaemonClient:
         """
         Connect to the running daemon:
           1. Open meta + ring shm
-          2. Write kv_cache IPC handle into meta
-          3. Wait for daemon_ready_flag
-          4. mmap cpu_pool shm
+          2. Write per-layer IPC handles into handles shm
+          3. Set rank_ready_flag
+          4. Wait for daemon_ready_flag
+          5. mmap cpu_pool shm
         """
         if self._attached:
             return
+        assert self._num_layers > 0, "Must call register_kv_layers() before attach()"
 
-        # 1. Open meta shm (daemon must have created it already)
         deadline = time.monotonic() + timeout_s
+
+        # 1. Wait for and open meta shm (daemon must have created it)
         while time.monotonic() < deadline:
             try:
                 self.meta_mm = _shm_open(_SHM_META_NAME, _META_SIZE)
@@ -152,8 +220,8 @@ class MMADaemonClient:
         # 2. Open ring shm
         self.ring_mm = _shm_open(_SHM_RING_NAME.format(rank=self.rank), _RING_TOTAL_BYTES)
 
-        # 3. Register kv_cache IPC handle
-        self._register_kv_cache()
+        # 3. Write per-layer IPC handles
+        self._register_kv_layers()
 
         # 4. Wait for daemon to finish mapping all IPC handles
         self._wait_daemon_ready(deadline)
@@ -165,15 +233,14 @@ class MMADaemonClient:
 
         self._attached = True
         logger.info(
-            "[Rank %d] Attached to MMA Relay Daemon. CPU pool: %.1f GB",
-            self.rank,
-            cpu_pool_size / 1e9,
+            "[Rank %d] Attached to MMA Relay Daemon. %d layers, CPU pool: %.1f GB",
+            self.rank, self._num_layers, cpu_pool_size / 1e9,
         )
 
     def detach(self) -> None:
         """Close shm mappings."""
-        if self.meta_mm:   self.meta_mm.close()
-        if self.ring_mm:   self.ring_mm.close()
+        if self.meta_mm:     self.meta_mm.close()
+        if self.ring_mm:     self.ring_mm.close()
         if self.cpu_pool_mm: self.cpu_pool_mm.close()
         self._attached = False
 
@@ -183,32 +250,39 @@ class MMADaemonClient:
 
     def submit_d2h(
         self,
+        layer_idx: int,
         gpu_byte_offset: int,
         cpu_slot_offset: int,
         size_bytes: int,
     ) -> int:
         """
-        Submit a GPU→CPU transfer request.
-        Returns job_id.
+        Submit a GPU→CPU transfer request for one layer.
 
-        gpu_byte_offset : offset from kv_cache_base_ptr (bytes)
-        cpu_slot_offset : offset into shared CPU pool (bytes), allocated via alloc_cpu_slot()
-        size_bytes      : transfer size in bytes
+        Args:
+            layer_idx       : index into registered layer list (see layer_index())
+            gpu_byte_offset : byte offset within layer tensor's allocation
+                              (e.g. block_id * block_stride_bytes)
+            cpu_slot_offset : byte offset into shared CPU pool (from alloc_cpu_slot())
+            size_bytes      : transfer size in bytes
+
+        Returns job_id.
         """
-        return self._push_request(DIR_D2H, gpu_byte_offset, cpu_slot_offset, size_bytes)
+        return self._push_request(DIR_D2H, layer_idx, gpu_byte_offset, cpu_slot_offset, size_bytes)
 
     def submit_h2d(
         self,
+        layer_idx: int,
         gpu_byte_offset: int,
         cpu_slot_offset: int,
         size_bytes: int,
     ) -> int:
         """Submit a CPU→GPU transfer request. Returns job_id."""
-        return self._push_request(DIR_H2D, gpu_byte_offset, cpu_slot_offset, size_bytes)
+        return self._push_request(DIR_H2D, layer_idx, gpu_byte_offset, cpu_slot_offset, size_bytes)
 
     def _push_request(
         self,
         direction: int,
+        layer_idx: int,
         gpu_offset: int,
         cpu_offset: int,
         size_bytes: int,
@@ -219,6 +293,8 @@ class MMADaemonClient:
         """
         assert self._attached
         assert self.ring_mm is not None
+        assert 0 <= layer_idx < self._num_layers, \
+            f"layer_idx={layer_idx} out of range [0, {self._num_layers})"
 
         mm = self.ring_mm
         job_id = self._next_job_id()
@@ -229,20 +305,21 @@ class MMADaemonClient:
             head = _read_u64(mm, _RING_HDR_HEAD)
             if tail - head < _RING_SLOTS:
                 break
-            # Ring full: yield briefly
             time.sleep(0)
 
         slot_off = _slot_base(mm, False, tail)
 
-        # Write slot fields (status LAST to signal slot is ready)
-        mm.seek(slot_off)
-        mm.write(struct.pack("<Q", job_id))              # job_id
-        # direction, status(=0 not ready yet), src_gpu, dst_gpu, pad
-        mm.write(struct.pack("BBBBI", direction, STATUS_PENDING ^ STATUS_PENDING, self.rank, self.rank, 0))
-        # skip to gpu_offset at _SLOT_OFF_GPU_OFFSET = 16
-        mm.seek(slot_off + 16)
+        # Write slot fields. Write status=PENDING last to commit the slot.
+        mm.seek(slot_off + _SLOT_OFF_JOB_ID)
+        mm.write(struct.pack("<Q", job_id))           # job_id (8 bytes)
+        mm.seek(slot_off + _SLOT_OFF_DIRECTION)
+        mm.write(struct.pack("BBB", direction, 0, self.rank))   # direction, status_tmp=0, src_gpu
+        mm.seek(slot_off + _SLOT_OFF_LAYER_IDX)
+        mm.write(struct.pack("<H", layer_idx))        # layer_idx (uint16)
+        mm.seek(slot_off + _SLOT_OFF_GPU_OFFSET)
         mm.write(struct.pack("<QQQ", gpu_offset, cpu_offset, size_bytes))
-        # Now write status=PENDING to commit the slot (memory ordering)
+
+        # Commit: write STATUS_PENDING into status byte
         mm.seek(slot_off + _SLOT_OFF_STATUS)
         mm.write(bytes([STATUS_PENDING]))
 
@@ -274,13 +351,12 @@ class MMADaemonClient:
         while compl_head != compl_tail:
             slot_off = _slot_base(mm, True, compl_head)
             mm.seek(slot_off)
-            raw = mm.read(24)   # job_id(8) + status(1) + pad(7) + ts(8)
+            raw = mm.read(24)
             job_id = struct.unpack_from("<Q", raw, 0)[0]
             status = raw[8]
             ok = (status == STATUS_DONE)
             results.append((job_id, ok))
 
-            # Free cpu slot
             if job_id in self._pending_jobs:
                 del self._pending_jobs[job_id]
 
@@ -300,7 +376,7 @@ class MMADaemonClient:
             for job_id, ok in self.poll_completions():
                 remaining.discard(job_id)
             if remaining:
-                time.sleep(0)  # yield
+                time.sleep(0)
 
         if remaining:
             raise TimeoutError(f"[Rank {self.rank}] Timed out waiting for jobs: {remaining}")
@@ -327,19 +403,12 @@ class MMADaemonClient:
     def get_cpu_tensor(self, cpu_offset: int, size_bytes: int, dtype: torch.dtype) -> torch.Tensor:
         """
         Return a CPU torch.Tensor backed by the shared pinned pool at cpu_offset.
-        Zero-copy: uses torch.frombuffer on the mmap'd region.
+        Uses torch.frombuffer on the mmap'd region (zero-copy).
         """
         assert self.cpu_pool_mm is not None
         self.cpu_pool_mm.seek(cpu_offset)
-        # frombuffer on mmap region gives a CPU tensor backed by shared memory
-        # This is the rank's view of the data daemon wrote
-        num_elements = size_bytes // torch.tensor([], dtype=dtype).element_size()
-        # Use numpy as intermediate (mmap → numpy → torch, zero extra copy)
-        import numpy as np
-        self.cpu_pool_mm.seek(cpu_offset)
         raw_bytes = self.cpu_pool_mm.read(size_bytes)
-        arr = np.frombuffer(raw_bytes, dtype=torch.zeros([], dtype=dtype).numpy().dtype)
-        return torch.from_numpy(arr.copy())  # copy needed to detach from mmap lifetime
+        return torch.frombuffer(raw_bytes, dtype=dtype)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -349,22 +418,48 @@ class MMADaemonClient:
         self._job_counter += 1
         return self._job_counter
 
-    def _register_kv_cache(self) -> None:
-        """Write kv_cache IPC handle + size into meta shm, set rank_ready_flag."""
+    def _register_kv_layers(self) -> None:
+        """
+        Export per-layer CUDA IPC handles and write them into a dedicated
+        handles shm segment. Then set num_layers and rank_ready_flag in meta.
+
+        Shm layout: /mma_relay_handles_{rank}
+          num_layers * _HANDLE_ENTRY_SIZE bytes
+          Each entry (80 bytes):
+            [0:8]   uint64  layer_size_bytes  (storage().nbytes())
+            [8:72]  bytes   cudaIpcMemHandle_t (64 bytes)
+            [72:80] uint64  reserved
+        """
         assert self.meta_mm is not None
 
-        # Get IPC handle for kv_cache tensor
-        handle_bytes = _get_ipc_handle(self.kv_cache_base_ptr)
-        assert len(handle_bytes) == _IPC_HANDLE_SIZE
+        num_layers = self._num_layers
+        handles_shm_size = num_layers * _HANDLE_ENTRY_SIZE
+        handles_mm = _shm_create(_SHM_HANDLES_NAME.format(rank=self.rank), handles_shm_size)
 
-        # Write size
-        size_off = _META_OFF_KV_SIZES + self.rank * 8
-        _write_u64(self.meta_mm, size_off, self.kv_cache_size)
+        for layer_idx, (base_ptr, size_bytes) in enumerate(
+            zip(self._layer_base_ptrs, self._layer_sizes)
+        ):
+            handle_bytes = _get_ipc_handle(base_ptr)
+            assert len(handle_bytes) == _IPC_HANDLE_SIZE
 
-        # Write IPC handle
-        handle_off = _META_OFF_IPC_HANDLES + self.rank * _IPC_HANDLE_SIZE
-        self.meta_mm.seek(handle_off)
-        self.meta_mm.write(handle_bytes)
+            entry_off = layer_idx * _HANDLE_ENTRY_SIZE
+            _write_u64(handles_mm, entry_off, size_bytes)          # layer size
+            handles_mm.seek(entry_off + 8)
+            handles_mm.write(handle_bytes)                          # IPC handle
+            # reserved bytes are zero-initialized by shm_create
+
+            logger.info(
+                "[Rank %d] Layer %d (%s): exported IPC handle, base_ptr=0x%x, size=%.1f MB",
+                self.rank, layer_idx,
+                self._layer_names[layer_idx] if layer_idx < len(self._layer_names) else "?",
+                base_ptr, size_bytes / 1e6,
+            )
+
+        handles_mm.flush()
+        handles_mm.close()
+
+        # Write num_layers into meta shm
+        _write_u64(self.meta_mm, _META_OFF_NUM_LAYERS + self.rank * 8, num_layers)
 
         # Set rank_ready_flag
         flag_off = _META_OFF_RANK_READY + self.rank * 8
@@ -372,9 +467,8 @@ class MMADaemonClient:
         self.meta_mm.flush()
 
         logger.info(
-            "[Rank %d] Registered kv_cache IPC handle (%.1f GB)",
-            self.rank,
-            self.kv_cache_size / 1e9,
+            "[Rank %d] Wrote %d layer IPC handles to shm, set rank_ready_flag",
+            self.rank, num_layers,
         )
 
     def _wait_daemon_ready(self, deadline: float) -> None:
