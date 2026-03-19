@@ -124,9 +124,12 @@ class MmaDaemonDirectionHandler(OffloadingHandler):
         ]
         self.total_block_bytes = sum(self.block_stride_bytes)
 
-        # For GPU tensors we need the base pointer and the offset from kv_cache base
-        self.gpu_base_ptr      = client.kv_cache_base_ptr
-        self.transfer_type     = ("GPU", "CPU") if gpu_to_cpu else ("CPU", "GPU")
+        # Per-layer base pointers (daemon maps each independently)
+        # layer_base_ptrs[i] = storage().data_ptr() of gpu_tensors[i]
+        self.layer_base_ptrs: list[int] = [
+            t.storage().data_ptr() for t in (src_tensors if gpu_to_cpu else dst_tensors)
+        ]
+        self.transfer_type = ("GPU", "CPU") if gpu_to_cpu else ("CPU", "GPU")
 
         self._transfers: deque[_PendingTransfer] = deque()
 
@@ -167,31 +170,55 @@ class MmaDaemonDirectionHandler(OffloadingHandler):
         # Allocate a CPU pool slot for this transfer
         cpu_offset = self.client.alloc_cpu_slot(total_bytes)
 
-        # Compute GPU byte offset (first sub-block offset from kv_cache base)
-        # For multi-tensor KV caches we transfer all layers as one contiguous blob:
-        # This requires the src_tensors to be contiguous within the kv_cache tensor.
-        # We use the first block's offset as the base and assume contiguous layout.
+        # ------------------------------------------------------------------
+        # Compute per-layer (layer_idx, gpu_offset) for each sub-transfer.
+        #
+        # gpu_tensors is a flat list parallel to layer_base_ptrs.
+        # For each layer i, the GPU base ptr is layer_base_ptrs[i] (the
+        # cudaMalloc base = storage().data_ptr()), and the offset within
+        # that allocation for a given block is:
+        #   (data_ptr_of_view - storage_base_ptr) + block_idx * block_stride
+        #
+        # We submit one daemon request per layer carrying:
+        #   layer_idx      → which IPC mapping to use
+        #   gpu_offset     → offset within that layer's cudaMalloc allocation
+        #   size_bytes     → bytes for all selected blocks in this layer
+        #
+        # This is exactly the same pattern as FlexKV's TensorSharedHandle:
+        #   handle per layer + offset within handle.
+        # ------------------------------------------------------------------
         if self.gpu_to_cpu:
-            gpu_tensor = self.src_tensors[0]
+            gpu_tensors = self.src_tensors
         else:
-            gpu_tensor = self.dst_tensors[0]
+            gpu_tensors = self.dst_tensors
+            # For H2D the expanded block indices come from dst
+            src_expanded, dst_expanded = dst_expanded, src_expanded
 
-        gpu_tensor_ptr = gpu_tensor.data_ptr()
-        first_block_idx = int(src_expanded[0] if self.gpu_to_cpu else dst_expanded[0])
-        gpu_offset_bytes = (gpu_tensor_ptr - self.gpu_base_ptr) + \
-                           first_block_idx * self.block_stride_bytes[0]
+        num_layers = len(gpu_tensors)
+        layer_bytes = total_bytes // num_layers  # bytes per layer (equal split)
 
-        # Submit to daemon
-        if self.gpu_to_cpu:
-            submitted_job = self.client.submit_d2h(gpu_offset_bytes, cpu_offset, total_bytes)
-        else:
-            submitted_job = self.client.submit_h2d(gpu_offset_bytes, cpu_offset, total_bytes)
+        submitted_jobs: list[int] = []
+        for layer_i, gpu_tensor in enumerate(gpu_tensors):
+            # Byte offset of the first selected block within this layer's alloc
+            first_block_idx = int(src_expanded[0]) if self.gpu_to_cpu else int(dst_expanded[0])
+            view_offset = gpu_tensor.data_ptr() - self.layer_base_ptrs[layer_i]
+            gpu_offset = view_offset + first_block_idx * self.block_stride_bytes[layer_i]
+
+            # cpu_offset is divided equally across layers (contiguous in cpu_pool)
+            layer_cpu_offset = cpu_offset + layer_i * layer_bytes
+
+            if self.gpu_to_cpu:
+                jid = self.client.submit_d2h(layer_i, gpu_offset, layer_cpu_offset, layer_bytes)
+            else:
+                jid = self.client.submit_h2d(layer_i, gpu_offset, layer_cpu_offset, layer_bytes)
+            submitted_jobs.append(jid)
 
         self._transfers.append(_PendingTransfer(
-            job_id=job_id,
+            job_id=job_id,        # caller's logical job_id (for get_finished)
             num_bytes=total_bytes,
             submit_ns=time.time_ns(),
             cpu_offset=cpu_offset,
+            daemon_job_ids=submitted_jobs,  # one daemon job per layer
         ))
         return True
 
@@ -333,34 +360,38 @@ class MmaCpuGpuOffloadingHandlers:
             )
 
         # ----------------------------------------------------------------
-        # Step 3: The "KV cache tensor" that we register with daemon is the
-        # first (and usually only contiguous) gpu_tensor in gpu_caches.
-        # All block offsets are computed relative to its data_ptr().
+        # Step 3: Register per-layer IPC handles with the daemon.
+        #
+        # Each layer in gpu_caches corresponds to one independent cudaMalloc
+        # allocation in vLLM (_allocate_kv_cache calls torch.zeros per layer
+        # for the uniform layout).  We must export a separate
+        # cudaIpcGetMemHandle for each layer's storage base pointer —
+        # NOT construct a fake cross-allocation slab.
+        #
+        # We pass gpu_caches directly; MMADaemonClient.register_kv_layers()
+        # uses tensor.storage().data_ptr() (the cudaMalloc base) for each
+        # layer, ensuring cudaIpcGetMemHandle receives a valid base pointer.
         # ----------------------------------------------------------------
-        # Use the first layer tensor as IPC registration target.
-        # For multi-tensor setups, all tensors are contiguous within the same
-        # cudaMalloc slab (guaranteed by vLLM's KV cache allocator).
-        # We register the full slab by using the min data_ptr and max extent.
-        kv_tensors = list(gpu_caches.values())
-        kv_base_ptr = min(t.data_ptr() for t in kv_tensors)
-        kv_end_ptr  = max(t.data_ptr() + t.numel() * t.element_size() for t in kv_tensors)
-        kv_size     = kv_end_ptr - kv_base_ptr
 
-        # Build a "view" tensor covering the full slab for IPC registration
-        import ctypes as _ct
-        kv_slab = torch.from_blob(
-            _ct.c_void_p(kv_base_ptr),
-            [kv_size],
-            dtype=torch.uint8,
-        )
-        # Ensure it's on the right CUDA device
-        kv_slab = kv_slab.cuda(rank)
+        # Build layer_name→tensor map preserving order (same as gpu_caches).
+        # For split_k_and_v tensors we register the pre-split (original) tensor,
+        # because unbind() returns views that share the same storage.
+        # The layer_idx used in transfer slots refers to this ordered list.
+        layer_kv_caches: dict[str, torch.Tensor] = {}
+        for layer_name, gpu_tensor in gpu_caches.items():
+            layer_kv_caches[layer_name] = gpu_tensor
 
         # ----------------------------------------------------------------
-        # Step 4: Attach to daemon via MMADaemonClient
+        # Step 4: Attach to daemon via MMADaemonClient (per-layer handles)
         # ----------------------------------------------------------------
-        self._client = MMADaemonClient(rank=rank, kv_cache_tensor=kv_slab)
+        self._client = MMADaemonClient(rank=rank)
+        self._client.register_kv_layers(layer_kv_caches)
         self._client.attach(timeout_s=daemon_timeout_s)
+
+        # Build layer_name → layer_idx lookup for transfer_async
+        self._layer_name_to_idx: dict[str, int] = {
+            name: idx for idx, name in enumerate(layer_kv_caches.keys())
+        }
 
         # ----------------------------------------------------------------
         # Step 5: Build CPU tensor views over shm cpu_pool

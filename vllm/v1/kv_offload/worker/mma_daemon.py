@@ -4,14 +4,14 @@ MMA Relay Daemon (方案2 - Relay Daemon)
 
 Architecture:
   - One Daemon process sees ALL physical GPUs (no CUDA_VISIBLE_DEVICES isolation)
-  - Each DP rank registers its GPU KV cache via CUDA IPC handles at startup
+  - Each DP rank registers per-layer GPU KV cache IPC handles at startup
   - Daemon owns and manages all pinned CPU memory
   - DP ranks communicate via lock-free shared-memory ring buffers (control plane)
   - Daemon executes NVLink relay transfers (data plane) using MMA engine
 
 Memory model:
   Control plane  : POSIX shm  ring buffers (one per rank, 64-byte slots)
-  GPU data plane : CUDA IPC   - rank exports kv_cache handle → daemon maps it
+  GPU data plane : CUDA IPC   - rank exports per-layer handles → daemon maps each
   CPU data plane : cudaHostAlloc(Portable) in daemon → mmap(MAP_SHARED) to ranks
 
 Performance targets:
@@ -44,6 +44,7 @@ logger = init_logger(__name__)
 # ---------------------------------------------------------------------------
 
 _MAX_DP_RANKS      = 8
+_MAX_LAYERS        = 256          # max number of KV cache layers per rank
 _RING_SLOTS        = 256          # must be power-of-2
 _RING_SLOT_BYTES   = 64           # one cacheline per slot
 _SHM_RING_NAME     = "/mma_relay_ring_{rank}"
@@ -69,14 +70,14 @@ STATUS_ERROR     = 3
 #   9  : uint8   status     (STATUS_*)
 #  10  : uint8   src_gpu    (physical GPU id)
 #  11  : uint8   dst_gpu    (physical GPU id, same as src_gpu for D2H)
-#  12  : uint32  _pad
-#  16  : uint64  gpu_offset  (byte offset into rank's kv_cache IPC mapping)
+#  12  : uint16  layer_idx  (index into per-rank layer handle table)
+#  14  : uint16  _pad
+#  16  : uint64  gpu_offset  (byte offset within the layer's IPC mapping)
 #  24  : uint64  cpu_slot_offset (byte offset into shared pinned CPU pool)
 #  32  : uint64  size_bytes
 #  40  : uint64  completion_ts_ns  (filled by daemon on done)
 #  48  : uint64  _reserved[2]
 
-_SLOT_FMT  = "<QBBBBIQQQQxx"   # 48 bytes + 2 padding → pad to 64 with [2]
 _SLOT_SIZE = 64
 
 _SLOT_OFF_JOB_ID      = 0
@@ -84,6 +85,7 @@ _SLOT_OFF_DIRECTION   = 8
 _SLOT_OFF_STATUS      = 9
 _SLOT_OFF_SRC_GPU     = 10
 _SLOT_OFF_DST_GPU     = 11
+_SLOT_OFF_LAYER_IDX   = 12   # uint16, NEW: index into layer handle table
 _SLOT_OFF_GPU_OFFSET  = 16
 _SLOT_OFF_CPU_OFFSET  = 24
 _SLOT_OFF_SIZE        = 32
@@ -100,28 +102,39 @@ _RING_COMPL_OFFSET = _RING_BODY_OFFSET + _RING_SLOTS * _SLOT_SIZE
 _RING_TOTAL_BYTES  = _RING_COMPL_OFFSET + _RING_SLOTS * _SLOT_SIZE
 
 # ---------------------------------------------------------------------------
-# Meta shared memory: IPC handle registry + CPU pool base
+# Meta shared memory: per-layer IPC handle registry + CPU pool base
 # ---------------------------------------------------------------------------
 # Layout:
 #   0   : uint32  num_ranks
 #   4   : uint32  _pad
 #   8   : uint64  cpu_pool_total_bytes
-#  16   : uint64  cpu_pool_shm_size         (actual mmap size)
-#  24   : uint64[8]  kv_cache_sizes          (bytes per rank)
-#  88   : uint8[8][64]  ipc_handles           (cudaIpcMemHandle_t = 64 bytes each)
-# 600   : uint64[8]  rank_ready_flags        (set to 1 when rank has written handle)
-# 664   : uint64    daemon_ready_flag         (set to 1 when daemon finished mapping)
+#  16   : uint64  cpu_pool_shm_size
+#  24   : uint64[8]  num_layers_per_rank      (filled by each rank at registration)
+#  88   : uint64[8]  rank_ready_flags         (set to 1 when rank has written all handles)
+# 152   : uint64    daemon_ready_flag          (set to 1 when daemon finished mapping)
+# 216   : (reserved / padding to 4096)
+#
+# Per-layer IPC handles are stored in a separate shm segment:
+#   /mma_relay_handles_{rank}   size = _MAX_LAYERS * (_IPC_HANDLE_SIZE + 16)
+#   Each entry (80 bytes):
+#     0  : uint64  layer_size_bytes
+#     8  : uint8[64]  ipc_handle  (cudaIpcMemHandle_t)
+#    72  : uint64  _reserved
+#
+# This design allows an arbitrary number of layers without inflating the
+# fixed-size meta shm.
 
-_META_SIZE            = 4096
-_META_OFF_NUM_RANKS   = 0
-_META_OFF_CPU_TOTAL   = 8
-_META_OFF_CPU_SHM_SZ  = 16
-_META_OFF_KV_SIZES    = 24           # 8 × uint64
-_META_OFF_IPC_HANDLES = 88           # 8 × 64 bytes
-_META_OFF_RANK_READY  = 600          # 8 × uint64
-_META_OFF_DAEMON_RDY  = 664          # uint64
+_META_SIZE              = 4096
+_META_OFF_NUM_RANKS     = 0
+_META_OFF_CPU_TOTAL     = 8
+_META_OFF_CPU_SHM_SZ    = 16
+_META_OFF_NUM_LAYERS    = 24     # 8 × uint64  (one per rank)
+_META_OFF_RANK_READY    = 88     # 8 × uint64
+_META_OFF_DAEMON_RDY    = 152    # uint64
 
-_IPC_HANDLE_SIZE = 64   # sizeof(cudaIpcMemHandle_t)
+_IPC_HANDLE_SIZE        = 64     # sizeof(cudaIpcMemHandle_t)
+_HANDLE_ENTRY_SIZE      = 80     # layer_size(8) + ipc_handle(64) + reserved(8)
+_SHM_HANDLES_NAME       = "/mma_relay_handles_{rank}"
 
 # ---------------------------------------------------------------------------
 # Low-level helpers  (ctypes / mmap wrappers)
@@ -129,8 +142,6 @@ _IPC_HANDLE_SIZE = 64   # sizeof(cudaIpcMemHandle_t)
 
 def _shm_create(name: str, size: int) -> mmap.mmap:
     """Create and zero-fill a POSIX shared memory segment."""
-    import tempfile
-    # Use /dev/shm directly for portability on Linux
     path = f"/dev/shm{name}"
     fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o600)
     os.ftruncate(fd, size)
@@ -183,7 +194,7 @@ def _slot_base(ring_mm: mmap.mmap, is_completion: bool, idx: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# CUDA IPC helpers  (via ctypes → libcuda)
+# CUDA IPC helpers  (via ctypes → libcudart)
 # ---------------------------------------------------------------------------
 
 _libcuda: Optional[ctypes.CDLL] = None
@@ -199,12 +210,14 @@ def _get_ipc_handle(device_ptr: int) -> bytes:
     """
     Call cudaIpcGetMemHandle and return the 64-byte handle as bytes.
     Must be called in the DP rank process that owns the pointer.
+    device_ptr must be the base pointer returned by cudaMalloc (i.e. tensor.data_ptr()
+    of the original allocation, NOT a pointer into the middle of a slab).
     """
     lib = ctypes.CDLL("libcudart.so", use_errno=True)
     handle_buf = ctypes.create_string_buffer(_IPC_HANDLE_SIZE)
     ret = lib.cudaIpcGetMemHandle(handle_buf, ctypes.c_void_p(device_ptr))
     if ret != 0:
-        raise RuntimeError(f"cudaIpcGetMemHandle failed: error {ret}")
+        raise RuntimeError(f"cudaIpcGetMemHandle failed: error {ret} for ptr=0x{device_ptr:x}")
     return bytes(handle_buf)
 
 
@@ -212,6 +225,7 @@ def _open_ipc_handle(handle_bytes: bytes, gpu_id: int) -> int:
     """
     Call cudaIpcOpenMemHandle on *gpu_id* and return the mapped device pointer.
     Must be called in the Daemon process (which sees all GPUs).
+    Returns the base pointer of the mapped region (= cudaMalloc base of rank's tensor).
     """
     lib = ctypes.CDLL("libcudart.so", use_errno=True)
     handle_buf = ctypes.create_string_buffer(handle_bytes, _IPC_HANDLE_SIZE)
@@ -264,10 +278,13 @@ class MMARelayDaemon:
     Startup protocol:
       1. Create /dev/shm/mma_relay_meta, /dev/shm/mma_relay_ring_N (N=0..num_ranks-1)
       2. Allocate pinned CPU pool, create /dev/shm/mma_relay_cpu_pool
-      3. Write cpu_pool base addr into meta shm
-      4. Wait for all rank_ready_flags → then IpcOpenMemHandle for each rank
-      5. Write daemon_ready_flag = 1 → ranks can start sending requests
-      6. Enter main poll loop: drain ring buffers, dispatch MMA transfers
+      3. Wait for all rank_ready_flags → then IpcOpenMemHandle for each layer of each rank
+      4. Write daemon_ready_flag = 1 → ranks can start sending requests
+      5. Enter main poll loop: drain ring buffers, dispatch MMA transfers
+
+    Per-layer handle layout (kv_layer_ptrs):
+      kv_layer_ptrs[rank][layer_idx] = daemon-side mapped pointer for that layer
+      kv_layer_sizes[rank][layer_idx] = size in bytes of that layer tensor
     """
 
     def __init__(self, num_ranks: int, cpu_pool_bytes: int, mma_config_path: Optional[str] = None):
@@ -282,9 +299,10 @@ class MMARelayDaemon:
         self.meta_mm: Optional[mmap.mmap] = None
         self.ring_mms: list[mmap.mmap] = []
 
-        # CUDA IPC mapped pointers  [rank] → int
-        self.kv_cache_ptrs: list[int] = [0] * num_ranks
-        self.kv_cache_sizes: list[int] = [0] * num_ranks
+        # Per-rank, per-layer mapped pointers
+        # kv_layer_ptrs[rank] = list of daemon-side mapped ptrs (one per layer)
+        self.kv_layer_ptrs: list[list[int]] = [[] for _ in range(num_ranks)]
+        self.kv_layer_sizes: list[list[int]] = [[] for _ in range(num_ranks)]
 
         # MMA import (only in daemon process)
         self._mma = None
@@ -311,14 +329,16 @@ class MMARelayDaemon:
     def shutdown(self) -> None:
         logger.info("[Daemon] Shutting down.")
         for rank in range(self.num_ranks):
-            if self.kv_cache_ptrs[rank]:
-                _close_ipc_handle(self.kv_cache_ptrs[rank])
+            for ptr in self.kv_layer_ptrs[rank]:
+                if ptr:
+                    _close_ipc_handle(ptr)
         if self.cpu_pool_ptr:
             _cuda_host_free(self.cpu_pool_ptr)
         _shm_unlink(_SHM_META_NAME)
         _shm_unlink(_SHM_CPU_POOL_NAME)
         for rank in range(self.num_ranks):
             _shm_unlink(_SHM_RING_NAME.format(rank=rank))
+            _shm_unlink(_SHM_HANDLES_NAME.format(rank=rank))
 
     # ------------------------------------------------------------------
     # Initialization helpers
@@ -338,31 +358,10 @@ class MMARelayDaemon:
         logger.info("[Daemon] Created %d ring shm segments + meta", self.num_ranks)
 
     def _alloc_cpu_pool(self) -> None:
-        """
-        Allocate pinned CPU pool with cudaHostAllocPortable.
-        Then expose it via a regular file-backed shm so ranks can mmap it.
-
-        Note: cudaHostAlloc memory cannot be directly shared via shm_open.
-        Instead we use a trick: allocate pinned memory, then create a
-        /dev/shm file of the same size. Ranks mmap the shm file, daemon
-        copies between shm and pinned memory in relay transfers.
-        
-        For maximum performance, we use a single contiguous pinned region
-        and track allocation offsets manually (slot allocator).
-        """
-        # Allocate pinned host memory in daemon
         self.cpu_pool_ptr = _cuda_host_alloc_portable(self.cpu_pool_bytes)
-
-        # Create shm backing for rank-accessible CPU buffer
-        # Ranks will mmap this to get CPU virtual addresses for the same pages
-        # We use /proc/self/mem trick: write the pinned phys pages into shm
-        # For simplicity in this implementation, we store base ptr in meta
-        # and ranks use daemon-provided cpu_slot_offset to know where their
-        # data landed; actual virtual addr mapping is done via the shm file.
         cpu_pool_mm = _shm_create(_SHM_CPU_POOL_NAME, self.cpu_pool_bytes)
         self.cpu_pool_mm = cpu_pool_mm
 
-        # Write metadata
         assert self.meta_mm is not None
         _write_u64(self.meta_mm, _META_OFF_CPU_TOTAL, self.cpu_pool_bytes)
         _write_u64(self.meta_mm, _META_OFF_CPU_SHM_SZ, self.cpu_pool_bytes)
@@ -405,29 +404,44 @@ class MMARelayDaemon:
         raise TimeoutError("[Daemon] Timed out waiting for rank registrations")
 
     def _map_ipc_handles(self) -> None:
+        """
+        For each rank, open the per-layer handles shm and call
+        cudaIpcOpenMemHandle for every layer independently.
+        This is the correct approach: each layer was allocated via a separate
+        cudaMalloc call in vLLM, so each needs its own IPC handle.
+        """
         assert self.meta_mm is not None
         for rank in range(self.num_ranks):
-            handle_off = _META_OFF_IPC_HANDLES + rank * _IPC_HANDLE_SIZE
-            self.meta_mm.seek(handle_off)
-            handle_bytes = self.meta_mm.read(_IPC_HANDLE_SIZE)
-            size_off = _META_OFF_KV_SIZES + rank * 8
-            kv_size = _read_u64(self.meta_mm, size_off)
-            self.kv_cache_sizes[rank] = kv_size
+            num_layers = int(_read_u64(self.meta_mm, _META_OFF_NUM_LAYERS + rank * 8))
+            handles_shm_size = num_layers * _HANDLE_ENTRY_SIZE
+            handles_mm = _shm_open(_SHM_HANDLES_NAME.format(rank=rank), handles_shm_size)
 
-            # Open IPC handle on the rank's GPU
-            # In daemon, GPU rank == physical GPU id (no CUDA_VISIBLE_DEVICES)
-            gpu_id = rank
-            mapped_ptr = _open_ipc_handle(handle_bytes, gpu_id)
-            self.kv_cache_ptrs[rank] = mapped_ptr
-            logger.info(
-                "[Daemon] Rank %d: kv_cache mapped at 0x%x (%.1f GB)",
-                rank, mapped_ptr, kv_size / 1e9,
-            )
+            gpu_id = rank  # daemon sees physical GPU ids without CUDA_VISIBLE_DEVICES
+            layer_ptrs: list[int] = []
+            layer_sizes: list[int] = []
+
+            for layer_idx in range(num_layers):
+                entry_off = layer_idx * _HANDLE_ENTRY_SIZE
+                layer_size = _read_u64(handles_mm, entry_off)
+                handles_mm.seek(entry_off + 8)
+                handle_bytes = handles_mm.read(_IPC_HANDLE_SIZE)
+
+                mapped_ptr = _open_ipc_handle(handle_bytes, gpu_id)
+                layer_ptrs.append(mapped_ptr)
+                layer_sizes.append(layer_size)
+                logger.info(
+                    "[Daemon] Rank %d layer %d: mapped at 0x%x (%.1f MB)",
+                    rank, layer_idx, mapped_ptr, layer_size / 1e6,
+                )
+
+            self.kv_layer_ptrs[rank] = layer_ptrs
+            self.kv_layer_sizes[rank] = layer_sizes
+            handles_mm.close()
+            logger.info("[Daemon] Rank %d: %d layers mapped.", rank, num_layers)
 
     def _signal_ready(self) -> None:
         assert self.meta_mm is not None
         _write_u64(self.meta_mm, _META_OFF_DAEMON_RDY, 1)
-        # Memory barrier: ensure all prior writes are visible
         self.meta_mm.flush()
         logger.info("[Daemon] daemon_ready_flag set. Ranks can proceed.")
 
@@ -436,11 +450,6 @@ class MMARelayDaemon:
     # ------------------------------------------------------------------
 
     def _poll_loop(self) -> None:
-        """
-        Hot loop: drain all ring buffers in round-robin, dispatch MMA transfers.
-        Uses spinning (no sleep) for minimum latency when load is high.
-        Falls back to 100μs sleep when all rings are empty.
-        """
         assert self._mma is not None
         idle_count = 0
 
@@ -464,41 +473,37 @@ class MMARelayDaemon:
         tail = _read_u64(mm, _RING_HDR_TAIL)
 
         if head == tail:
-            return False  # ring empty
+            return False
 
         did_work = False
         while head != tail:
             slot_off = _slot_base(mm, False, head)
 
-            # Read slot fields
             mm.seek(slot_off)
             raw = mm.read(_SLOT_SIZE)
-            job_id      = struct.unpack_from("<Q", raw, _SLOT_OFF_JOB_ID)[0]
-            direction   = raw[_SLOT_OFF_DIRECTION]
-            status      = raw[_SLOT_OFF_STATUS]
-            src_gpu     = raw[_SLOT_OFF_SRC_GPU]
-            gpu_offset  = struct.unpack_from("<Q", raw, _SLOT_OFF_GPU_OFFSET)[0]
-            cpu_offset  = struct.unpack_from("<Q", raw, _SLOT_OFF_CPU_OFFSET)[0]
-            size_bytes  = struct.unpack_from("<Q", raw, _SLOT_OFF_SIZE)[0]
+            job_id     = struct.unpack_from("<Q", raw, _SLOT_OFF_JOB_ID)[0]
+            direction  = raw[_SLOT_OFF_DIRECTION]
+            status     = raw[_SLOT_OFF_STATUS]
+            layer_idx  = struct.unpack_from("<H", raw, _SLOT_OFF_LAYER_IDX)[0]
+            gpu_offset = struct.unpack_from("<Q", raw, _SLOT_OFF_GPU_OFFSET)[0]
+            cpu_offset = struct.unpack_from("<Q", raw, _SLOT_OFF_CPU_OFFSET)[0]
+            size_bytes = struct.unpack_from("<Q", raw, _SLOT_OFF_SIZE)[0]
 
             if status != STATUS_PENDING:
-                # Slot not ready yet (rank hasn't finished writing)
                 break
 
-            # Dispatch transfer via MMA
             ok = self._dispatch_transfer(
                 rank=rank,
                 job_id=job_id,
                 direction=direction,
+                layer_idx=layer_idx,
                 gpu_offset=gpu_offset,
                 cpu_offset=cpu_offset,
                 size_bytes=size_bytes,
             )
 
-            # Write completion slot
             self._write_completion(rank, job_id, STATUS_DONE if ok else STATUS_ERROR)
 
-            # Advance head
             head += 1
             _write_u64(mm, _RING_HDR_HEAD, head)
             did_work = True
@@ -510,35 +515,49 @@ class MMARelayDaemon:
         rank: int,
         job_id: int,
         direction: int,
+        layer_idx: int,
         gpu_offset: int,
         cpu_offset: int,
         size_bytes: int,
     ) -> bool:
         """
         Issue a MMA batch transfer.
-        GPU pointer = kv_cache_ptrs[rank] + gpu_offset  (daemon virtual addr)
-        CPU pointer = cpu_pool_ptr + cpu_offset          (pinned memory addr)
+
+        GPU pointer = kv_layer_ptrs[rank][layer_idx] + gpu_offset
+          - kv_layer_ptrs[rank][layer_idx] is the daemon-side base ptr of that
+            layer's cudaMalloc allocation (obtained via cudaIpcOpenMemHandle).
+          - gpu_offset is the byte offset within that single layer tensor
+            (e.g. block_id * block_stride), always within bounds of that allocation.
+
+        CPU pointer = cpu_pool_ptr + cpu_offset
         """
         assert self._mma is not None
         assert self.cpu_pool_mm is not None
 
-        gpu_ptr = self.kv_cache_ptrs[rank] + gpu_offset
+        if layer_idx >= len(self.kv_layer_ptrs[rank]):
+            logger.error(
+                "[Daemon] Invalid layer_idx=%d for rank=%d (num_layers=%d)",
+                layer_idx, rank, len(self.kv_layer_ptrs[rank]),
+            )
+            return False
+
+        layer_base_ptr = self.kv_layer_ptrs[rank][layer_idx]
+        gpu_ptr = layer_base_ptr + gpu_offset
         cpu_ptr = self.cpu_pool_ptr + cpu_offset
 
         try:
             if direction == DIR_D2H:
-                # GPU → CPU  (KV eviction to host)
                 self._mma.batch_d2h_async(
                     [cpu_ptr], [gpu_ptr], [size_bytes], stream=None
                 )
             else:
-                # CPU → GPU  (KV reload to device)
                 self._mma.batch_h2d_async(
                     [gpu_ptr], [cpu_ptr], [size_bytes], stream=None
                 )
             return True
         except Exception as e:
-            logger.error("[Daemon] Transfer failed rank=%d job=%d: %s", rank, job_id, e)
+            logger.error("[Daemon] Transfer failed rank=%d job=%d layer=%d: %s",
+                         rank, job_id, layer_idx, e)
             return False
 
     def _write_completion(self, rank: int, job_id: int, status: int) -> None:
@@ -549,9 +568,9 @@ class MMARelayDaemon:
 
         mm.seek(slot_off)
         ts = time.time_ns()
-        mm.write(struct.pack("<Q", job_id))        # job_id
-        mm.write(bytes([status, 0, 0, 0, 0, 0, 0, 0]))  # status + pad
-        mm.write(struct.pack("<Q", ts))            # ts
+        mm.write(struct.pack("<Q", job_id))
+        mm.write(bytes([status, 0, 0, 0, 0, 0, 0, 0]))
+        mm.write(struct.pack("<Q", ts))
 
         compl_tail += 1
         _write_u64(mm, _RING_HDR_COMPL_TAIL, compl_tail)
