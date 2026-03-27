@@ -60,7 +60,3 @@ OffloadingSpecFactory.register_spec(
 OffloadingSpecFactory.register_spec(
     "MMAOffloadingSpec", "vllm.v1.kv_offload.mma", "MMAOffloadingSpec"
 )
-
-OffloadingSpecFactory.register_spec(
-    "MMADaemonOffloadingSpec", "vllm.v1.kv_offload.mma", "MMADaemonOffloadingSpec"
-)
