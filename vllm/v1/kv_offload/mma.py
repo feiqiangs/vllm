@@ -61,7 +61,7 @@ class MMAOffloadingSpec(OffloadingSpec):
             "eviction_policy", "lru"
         )
         self.timeout_s: float = float(
-            self.extra_config.get("timeout_s", 60.0)
+            self.extra_config.get("timeout_s", 120.0)
         )
 
         # rank / num_ranks — DP-aware

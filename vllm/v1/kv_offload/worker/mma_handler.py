@@ -96,12 +96,11 @@ class MmaDirectionHandler(OffloadingHandler):
         self,
         client: MMAClient,
         src_tensors: list[torch.Tensor],
-        dst_tensors: list[torch.Tensor],
         src_block_size_factor: int,
         dst_block_size_factor: int,
         gpu_to_cpu: bool,
+        dst_tensors: list[torch.Tensor] | None = None,
     ):
-        assert len(src_tensors) == len(dst_tensors)
         self.client = client
         self.src_tensors = src_tensors
         self.dst_tensors = dst_tensors
@@ -118,10 +117,12 @@ class MmaDirectionHandler(OffloadingHandler):
         ]
         self.total_block_bytes = sum(self.block_stride_bytes)
 
+        # OPT-6 (scheme B): dst_tensors is optional for MMA — CPU side
+        # is managed by the Daemon.  GPU tensors are always needed.
+        gpu_tensors = src_tensors if gpu_to_cpu else (dst_tensors or [])
         # Per-layer base pointers
         self.layer_base_ptrs: list[int] = [
-            t.storage().data_ptr()
-            for t in (src_tensors if gpu_to_cpu else dst_tensors)
+            t.storage().data_ptr() for t in gpu_tensors
         ]
         self.transfer_type = ("GPU", "CPU") if gpu_to_cpu else ("CPU", "GPU")
 
@@ -188,35 +189,53 @@ class MmaDirectionHandler(OffloadingHandler):
 
         direction = 0 if self.gpu_to_cpu else 1  # DIR_D2H=0, DIR_H2D=1
 
-        # Build per-(layer, sub-block) parameters for batch submission.
-        # Each sub-block is a separate transfer item so the Daemon
-        # performs scatter/gather DMA for non-contiguous block IDs.
-        layer_indices: list[int] = []
-        gpu_offsets: list[int] = []
-        cpu_offsets: list[int] = []
-        sizes: list[int] = []
+        # OPT-2: NumPy vectorized parameter construction.
+        # Replaces O(num_layers × num_blocks) Python loop with
+        # a few NumPy broadcast operations (~10-50x faster).
+        num_layers = len(gpu_tensors)
+        num_blocks = dst_sub_count
 
-        cumulative_cpu_offset = 0
-        for layer_i, gpu_tensor in enumerate(gpu_tensors):
-            view_offset = gpu_tensor.data_ptr() - self.layer_base_ptrs[layer_i]
-            block_stride = self.block_stride_bytes[layer_i]
+        # Per-layer view offsets and block strides as arrays
+        view_offsets_arr = np.array(
+            [t.data_ptr() - self.layer_base_ptrs[i]
+             for i, t in enumerate(gpu_tensors)],
+            dtype=np.int64,
+        )
+        block_strides_arr = np.array(
+            self.block_stride_bytes[:num_layers], dtype=np.int64,
+        )
 
-            for blk_j in range(dst_sub_count):
-                gpu_blk_idx = int(gpu_block_indices[blk_j])
-                gpu_offset_ij = view_offset + gpu_blk_idx * block_stride
-                cpu_offset_ij = cpu_offset + cumulative_cpu_offset
+        # GPU offsets: broadcast (num_layers, 1) + (1, num_blocks) * stride
+        gpu_blk_arr = gpu_block_indices.astype(np.int64)  # shape: [num_blocks]
+        # (num_layers, num_blocks)
+        gpu_offsets_2d = (
+            view_offsets_arr[:, None]
+            + gpu_blk_arr[None, :] * block_strides_arr[:, None]
+        )
 
-                layer_indices.append(layer_i)
-                gpu_offsets.append(gpu_offset_ij)
-                cpu_offsets.append(cpu_offset_ij)
-                sizes.append(block_stride)
-                cumulative_cpu_offset += block_stride
+        # CPU offsets: sequential layout, accounting for per-layer strides
+        # Each layer contributes num_blocks items with its own block_stride.
+        # Layout: [layer0_blk0, layer0_blk1, ..., layer1_blk0, ...]
+        total_items = num_layers * num_blocks
+        # Cumulative byte offset per item within the CPU region
+        cpu_item_sizes = np.repeat(block_strides_arr, num_blocks)
+        cpu_offsets_flat = cpu_offset + np.concatenate(
+            ([0], np.cumsum(cpu_item_sizes[:-1]))
+        ).astype(np.int64)
+
+        # Layer indices: [0,0,...,1,1,...,2,2,...]
+        layer_indices = np.repeat(
+            np.arange(num_layers, dtype=np.int32), num_blocks
+        ).tolist()
+        gpu_offsets = gpu_offsets_2d.ravel().tolist()
+        cpu_offsets_list = cpu_offsets_flat.tolist()
+        sizes = cpu_item_sizes.tolist()
 
         # Batch submit all (layer, sub-block) items at once.
         # submit_batch returns (job_ids, batch_id) — completion tracking
         # is at batch granularity via batch_id.
         submitted_jobs, batch_id = self.client.submit_batch(
-            direction, layer_indices, gpu_offsets, cpu_offsets, sizes
+            direction, layer_indices, gpu_offsets, cpu_offsets_list, sizes
         )
 
         pending = _PendingTransfer(
@@ -344,7 +363,7 @@ class MmaCpuGpuOffloadingHandlers:
         attn_backends: dict[str, type[AttentionBackend]],
         cpu_pool_bytes: int,
         mma_config_path: str | None = None,
-        timeout_s: float = 60.0,
+        timeout_s: float = 120.0,
         device_ids: list[int] | None = None,
     ):
         assert gpu_caches
@@ -425,39 +444,25 @@ class MmaCpuGpuOffloadingHandlers:
         self._client.start(timeout_s=timeout_s)
 
         # ----------------------------------------------------------------
-        # Step 4: Build CPU tensor views (for interface compatibility)
-        # ----------------------------------------------------------------
-        num_cpu_kernel_blocks = num_cpu_blocks * cpu_block_size_factor
-        cpu_tensors: list[torch.Tensor] = []
-        for gpu_tensor, split_k_and_v in parsed_gpu_tensors:
-            cpu_shape = list(gpu_tensor.shape)
-            cpu_shape[1 if split_k_and_v else 0] = num_cpu_kernel_blocks
-
-            cpu_tensor = torch.zeros(
-                cpu_shape, dtype=gpu_tensor.dtype, device="cpu"
-            )
-            cpu_tensors.extend(
-                cpu_tensor.unbind(0) if split_k_and_v else [cpu_tensor]
-            )
-
-        # ----------------------------------------------------------------
-        # Step 5: Create directional handlers
+        # Step 4: Create directional handlers
+        # OPT-6 (scheme B): No CPU tensor allocation — CPU memory is
+        # managed by the Daemon's cudaHostAllocPortable pool.  The
+        # handler only needs GPU-side tensor info.
         # ----------------------------------------------------------------
         self.gpu_to_cpu_handler = MmaDirectionHandler(
             client=self._client,
             src_tensors=gpu_tensors,
-            dst_tensors=cpu_tensors,
             src_block_size_factor=gpu_block_size_factor,
             dst_block_size_factor=cpu_block_size_factor,
             gpu_to_cpu=True,
         )
         self.cpu_to_gpu_handler = MmaDirectionHandler(
             client=self._client,
-            src_tensors=cpu_tensors,
-            dst_tensors=gpu_tensors,
+            src_tensors=gpu_tensors,
             src_block_size_factor=cpu_block_size_factor,
             dst_block_size_factor=gpu_block_size_factor,
             gpu_to_cpu=False,
+            dst_tensors=gpu_tensors,
         )
 
         logger.info(
